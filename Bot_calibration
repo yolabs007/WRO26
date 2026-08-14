@@ -1,0 +1,83 @@
+# ============================================================
+# CALIBRATION TEST — dial in WHEEL_DIAMETER and AXLE_TRACK
+# Press the hub buttons to run each test.
+#   LEFT button  = 800 mm straight test - you can change the number in code 
+#   RIGHT button = 360 deg turn test
+# Toggle USE_GYRO below and compare results.
+# ============================================================
+
+from pybricks.hubs import PrimeHub
+from pybricks.pupdevices import Motor
+from pybricks.parameters import Port, Direction, Button
+from pybricks.robotics import DriveBase
+from pybricks.tools import wait
+
+# ------------------------------------------------------------
+# PORT CONFIGURATION
+# ------------------------------------------------------------
+LEFT_MOTOR_PORT    = Port.F # please check ur actual port 
+RIGHT_MOTOR_PORT   = Port.B # please check ur actual port
+LEFT_MOTOR_REVERSED  = True # flip if not moving straight or front
+RIGHT_MOTOR_REVERSED = False # flip if not moving straight or front
+
+# ------------------------------------------------------------
+# TUNABLE CONSTANTS — the two numbers we're calibrating
+# ------------------------------------------------------------
+WHEEL_DIAMETER = 56      # mm — small Spike wheels; adjust from straight test
+AXLE_TRACK     = 165     # mm — adjust from turn test
+
+#USE_GYRO       = True    # <<< flip this to compare with/without gyro
+USE_GYRO       =  False    # do the test with and without gyro
+STRAIGHT_TEST_MM  = 800  # straight test distance
+TURN_TEST_DEG     = 360  # turn test angle (full spin)
+
+# ------------------------------------------------------------
+# SETUP
+# ------------------------------------------------------------
+hub = PrimeHub()
+left_motor = Motor(LEFT_MOTOR_PORT,
+    Direction.COUNTERCLOCKWISE if LEFT_MOTOR_REVERSED else Direction.CLOCKWISE)
+right_motor = Motor(RIGHT_MOTOR_PORT,
+    Direction.COUNTERCLOCKWISE if RIGHT_MOTOR_REVERSED else Direction.CLOCKWISE)
+
+drive = DriveBase(left_motor, right_motor,
+                  wheel_diameter=WHEEL_DIAMETER,
+                  axle_track=AXLE_TRACK)
+drive.use_gyro(USE_GYRO)
+
+print("Gyro:", "ON" if USE_GYRO else "OFF")
+print("LEFT button  = straight", STRAIGHT_TEST_MM, "mm")
+print("RIGHT button = turn", TURN_TEST_DEG, "deg")
+print("Ready.")
+
+# ------------------------------------------------------------
+# TEST LOOP
+# ------------------------------------------------------------
+while True:
+    pressed = hub.buttons.pressed()
+
+    if Button.LEFT in pressed:
+        wait(500)                    # time to remove your hand
+        drive.reset()
+        drive.straight(STRAIGHT_TEST_MM)
+        print("--- STRAIGHT TEST ---")
+        print("Commanded:", STRAIGHT_TEST_MM, "mm")
+        print("Robot thinks it went:", drive.distance(), "mm")
+        print("NOW: measure ACTUAL distance with tape/ruler")
+        print("If actual > commanded -> DECREASE wheel diameter")
+        print("If actual < commanded -> INCREASE wheel diameter")
+        print("")
+
+    if Button.RIGHT in pressed:
+        wait(500)
+        drive.reset()
+        drive.turn(TURN_TEST_DEG)
+        print("--- TURN TEST ---")
+        print("Commanded:", TURN_TEST_DEG, "deg")
+        print("Robot thinks it turned:", drive.angle(), "deg")
+        print("NOW: check if robot faces EXACTLY the same direction")
+        print("If over-rotated  -> DECREASE axle track")
+        print("If under-rotated -> INCREASE axle track")
+        print("")
+
+    wait(50)
