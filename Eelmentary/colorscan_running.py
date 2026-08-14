@@ -1,8 +1,9 @@
 # ============================================================
-# SCAN v8 — GREEN/RED anchored slot logic, self-calibrating
-# Fixed anchors: GREEN = slot 2, RED = slot 3.
-# Spacing measured live from green->red distance.
-# BLACK found by gap analysis on whichever side has 1 color.
+# SCAN v8.1 — yesterday's code + double-white resolution
+# NEW: every detection records its peak V. If TWO whites are
+# found, the stronger is WHITE, the weaker becomes BLACK.
+# If black is invisible (one white only), elimination logic
+# works exactly as yesterday. Nothing else changed.
 # ============================================================
 
 from pybricks.hubs import PrimeHub
@@ -12,9 +13,9 @@ from pybricks.robotics import DriveBase
 from pybricks.tools import wait, StopWatch
 
 # --- PORT CONFIG ---
-LEFT_MOTOR_PORT    = Port.F
-RIGHT_MOTOR_PORT   = Port.B
-COLOR_SENSOR_PORT  = Port.D
+LEFT_MOTOR_PORT    = Port.A
+RIGHT_MOTOR_PORT   = Port.E
+COLOR_SENSOR_PORT  = Port.C
 LEFT_MOTOR_REVERSED  = True
 RIGHT_MOTOR_REVERSED = False
 
@@ -25,7 +26,11 @@ SCAN_SPEED     = 100
 SCAN_LENGTH    = 1050
 MIN_GAP        = 40
 
-# --- CLASSIFIER (locked) ---
+APPROACH_SPEED = 400
+APPROACH_MM    = 440
+APPROACH_TURN  = -90
+
+# --- CLASSIFIER (yesterday's thresholds, unchanged) ---
 SAT_MIN, V_MIN = 55, 2
 WHITE_S_MAX, WHITE_V_MIN = 30, 5
 
@@ -59,11 +64,12 @@ timer = StopWatch()
 def log(msg):
     print("[{:>5.1f}s] {}".format(timer.time() / 1000, msg))
 
-# --- SCAN PASS (unchanged — detection works well) ---
+# --- SCAN PASS — now records peak V per detection ---
 def scan_row():
     log("SCAN: start")
-    found = []
+    found = []                    # (entry_pos, color, peak_v)
     last, hits, entry_pos = None, 0, 0
+    peak_v = 0
     rearm_at = 0
 
     drive.reset()
@@ -76,14 +82,16 @@ def scan_row():
             c = classify(hsv.h, hsv.s, hsv.v)
             if c is not None and c == last:
                 hits += 1
+                peak_v = max(peak_v, hsv.v)
             elif c is not None:
                 last, hits, entry_pos = c, 1, d
+                peak_v = hsv.v
             else:
                 last, hits = None, 0
 
             if hits >= 2:
-                found.append((entry_pos, c))
-                log("  {} at ~{} mm".format(c, entry_pos))
+                found.append((entry_pos, c, peak_v))
+                log("  {} at ~{} mm (peak V {})".format(c, entry_pos, peak_v))
                 rearm_at = d + MIN_GAP
                 last, hits = None, 0
         wait(20)
@@ -91,38 +99,51 @@ def scan_row():
     drive.stop()
     return found
 
-# --- MERGE consecutive same-color detections into one note ---
+# --- MERGE split bases (tracks peak V across merge) ---
 def merge(detections):
     merged = []
-    for pos, c in detections:
-        if merged and merged[-1][1] == c:
-            continue                     # split base -> keep first pos
-        merged.append((pos, c))
+    for pos, c, pv in detections:
+        if merged and merged[-1][1] == c and pos - merged[-1][0] < 70:
+            p0, c0, pv0 = merged[-1]
+            merged[-1] = (p0, c0, max(pv0, pv))    # split base
+            continue
+        merged.append((pos, c, pv))
     return merged
 
-# --- SLOT LOGIC: anchored on GREEN(2) and RED(3) ---
+# --- NEW: double-white resolution ---
+def resolve_double_white(notes):
+    """If two whites: stronger stays WHITE, weaker becomes BLACK."""
+    whites = [n for n in notes if n[1] == "WHITE"]
+    if len(whites) == 2:
+        weaker = min(whites, key=lambda n: n[2])
+        log("Double white: {} mm (V {}) vs {} mm (V {}) — weaker is BLACK"
+            .format(whites[0][0], whites[0][2], whites[1][0], whites[1][2]))
+        notes = [(p, "BLACK", pv) if (p == weaker[0] and c == "WHITE")
+                 else (p, c, pv) for p, c, pv in notes]
+    elif len(whites) > 2:
+        print("WARNING: {} whites detected — check thresholds!".format(len(whites)))
+    return notes
+
+# --- SLOT LOGIC: GREEN(2)/RED(3) anchored ---
 def build_map(detections):
-    notes = merge(detections)
-    colors = [c for _, c in notes]
-    pos = {c: p for p, c in notes}       # first-entry position per color
+    notes = resolve_double_white(merge(detections))
+    colors = [c for _, c, _ in notes]
+    pos = {c: p for p, c, _ in notes}
     slot_map = [None] * 6
 
-    # anchors must exist
     if "GREEN" not in pos or "RED" not in pos:
         print("ERROR: GREEN/RED anchor missing — got", colors)
         return slot_map
 
     slot_map[2] = "GREEN"
     slot_map[3] = "RED"
-
-    # live spacing reference: green->red is exactly 1 slot
     spacing = pos["RED"] - pos["GREEN"]
     log("spacing reference (green->red) = {} mm".format(spacing))
 
     gi = colors.index("GREEN")
     ri = colors.index("RED")
-    before = [(pos[c], c) for c in colors[:gi]]      # left of green
-    after  = [(pos[c], c) for c in colors[ri + 1:]]  # right of red
+    before = [(pos[c], c) for c in colors[:gi]]
+    after  = [(pos[c], c) for c in colors[ri + 1:]]
     if ri != gi + 1:
         print("WARNING: unexpected color between GREEN and RED:",
               colors[gi + 1:ri])
@@ -133,16 +154,16 @@ def build_map(detections):
     elif len(before) == 1:
         p, c = before[0]
         gap = pos["GREEN"] - p
-        if gap < 1.5 * spacing:          # adjacent to green -> slot 1
+        if gap < 1.5 * spacing:
             slot_map[1] = c
             slot_map[0] = "BLACK"
-            log("BLACK at slot 0 ({}->GREEN gap {} ~ 1x spacing)".format(c, gap))
-        else:                            # far from green -> slot 0
+            log("BLACK at slot 0 ({}->GREEN gap {} ~ 1x)".format(c, gap))
+        else:
             slot_map[0] = c
             slot_map[1] = "BLACK"
-            log("BLACK at slot 1 ({}->GREEN gap {} ~ 2x spacing)".format(c, gap))
+            log("BLACK at slot 1 ({}->GREEN gap {} ~ 2x)".format(c, gap))
     else:
-        print("WARNING: {} colors left of GREEN — expected 1 or 2".format(len(before)))
+        print("WARNING: {} colors left of GREEN".format(len(before)))
 
     # ---- right side: slots 4, 5 ----
     if len(after) == 2:
@@ -150,34 +171,30 @@ def build_map(detections):
     elif len(after) == 1:
         p, c = after[0]
         gap = p - pos["RED"]
-        if gap < 1.5 * spacing:          # adjacent to red -> slot 4
+        if gap < 1.5 * spacing:
             slot_map[4] = c
             slot_map[5] = "BLACK"
-            log("BLACK at slot 5 (RED->{} gap {} ~ 1x spacing)".format(c, gap))
-        else:                            # far from red -> slot 5
+            log("BLACK at slot 5 (RED->{} gap {} ~ 1x)".format(c, gap))
+        else:
             slot_map[5] = c
             slot_map[4] = "BLACK"
-            log("BLACK at slot 4 (RED->{} gap {} ~ 2x spacing)".format(c, gap))
+            log("BLACK at slot 4 (RED->{} gap {} ~ 2x)".format(c, gap))
     else:
-        print("WARNING: {} colors right of RED — expected 1 or 2".format(len(after)))
+        print("WARNING: {} colors right of RED".format(len(after)))
 
-    # sanity: exactly one BLACK
     if slot_map.count("BLACK") != 1:
-        print("WARNING: BLACK placed {} times — one side missed a color"
-              .format(slot_map.count("BLACK")))
+        print("WARNING: BLACK placed {} times".format(slot_map.count("BLACK")))
 
     return slot_map
 
-# 1. Approach: fast straight, then turn onto the note row
-drive.settings(straight_speed= 400)
-drive.straight(440)
-drive.turn(-90)
-
-
-
-
 # --- RUN ---
 timer.reset()
+
+# approach: fast straight + left turn onto the row
+drive.settings(straight_speed=APPROACH_SPEED)
+drive.straight(APPROACH_MM)
+drive.turn(APPROACH_TURN)
+
 detections = scan_row()
 slot_map = build_map(detections)
 
