@@ -1,0 +1,372 @@
+# ============================================================
+# WRO ELEMENTARY — SCAN + CABLE 1 (v3 — PURE PYBRICKS NAV)
+#
+# CHANGE FROM v2: turn_abs / straight_abs / goto_heading are
+# REMOVED. All navigation now uses ONLY standard Pybricks:
+#     drive.straight(mm)   and   drive.turn(deg)
+# Every move is relative and visible right in the mission code.
+#
+# HEADING LEDGER (relative turns, tracked in comments):
+#   start 0  ->  turn -90 (scan row)  ->  -90
+#   -> turn -90 (cable pickup)        ->  -180
+#   -> turn -60 (drop approach)       ->  -240   (confirmed)
+#
+# drive.reset() ONCE at run start — still needed because
+# scan_row() tracks distance via drive.distance() offset.
+# Gyro stays ON: straight() and turn() are gyro-regulated.
+#
+# GRABBER MAP (rebuilt grabber): 0 raised | 40 PC | 70 trap
+# ============================================================
+
+from pybricks.hubs import PrimeHub
+from pybricks.pupdevices import Motor, ColorSensor
+from pybricks.parameters import Port, Direction, Stop
+from pybricks.robotics import DriveBase
+from pybricks.tools import wait, StopWatch
+
+# ------------------------------------------------------------
+# PORT CONFIGURATION (FINAL — A/E drive, B=Back, F=Forward
+# grabber, C=side Color, D=Down color)
+# ------------------------------------------------------------
+LEFT_MOTOR_PORT     = Port.A
+BACK_GRAB_PORT      = Port.B
+COLOR_SIDE_PORT     = Port.C
+COLOR_DOWN_PORT     = Port.D
+RIGHT_MOTOR_PORT    = Port.E
+FRONT_GRAB_PORT     = Port.F
+
+LEFT_MOTOR_REVERSED  = True
+RIGHT_MOTOR_REVERSED = False
+
+WHEEL_DIAMETER = 56
+AXLE_TRACK     = 165
+
+# --- SCAN TUNABLES ---
+SCAN_SPEED     = 300
+SCAN_LENGTH    = 1000
+MIN_GAP        = 40
+APPROACH_SPEED = 300
+APPROACH_MM    = 380
+
+
+
+# --- GRABBER POSITIONS (rebuilt grabber — fine-tune here) ---
+BACK_RAISED  = 0       # fully up / travel position
+BACK_PC      = 30      # partial close (pre-position over cable)
+BACK_TRAP    = 61      # down / cable trapped
+BACK_RELEASE = 30     # release height — TUNE
+
+FRONT_OPEN   = 0
+FRONT_READY  = 30
+FRONT_CLOSED = 100     # TUNE
+
+# --- CLASSIFIER (locked thresholds) ---
+SAT_MIN, V_MIN = 55, 2
+WHITE_S_MAX, WHITE_V_MIN = 30, 5
+
+# ------------------------------------------------------------
+# HARDWARE SETUP
+# ------------------------------------------------------------
+hub = PrimeHub()
+left_motor = Motor(LEFT_MOTOR_PORT,
+    Direction.COUNTERCLOCKWISE if LEFT_MOTOR_REVERSED else Direction.CLOCKWISE)
+right_motor = Motor(RIGHT_MOTOR_PORT,
+    Direction.COUNTERCLOCKWISE if RIGHT_MOTOR_REVERSED else Direction.CLOCKWISE)
+front_grab = Motor(FRONT_GRAB_PORT)     # bare — never add direction
+back_grab  = Motor(BACK_GRAB_PORT)      # bare — never add direction
+floor_sensor = ColorSensor(COLOR_SIDE_PORT)
+
+drive = DriveBase(left_motor, right_motor, WHEEL_DIAMETER, AXLE_TRACK)
+drive.use_gyro(True)
+drive.settings(straight_speed=200)
+
+timer = StopWatch()
+
+def log(msg):
+    print("[{:>5.1f}s] {}".format(timer.time() / 1000, msg))
+
+# ------------------------------------------------------------
+# GRABBERS — run_target absolute, stall-protected
+# (unchanged — this is standard Pybricks run_target usage)
+# ------------------------------------------------------------
+GRAB_SPEED = 300
+
+def _grab_goto(motor, target_deg, name):
+    motor.run_target(GRAB_SPEED, target_deg, then=Stop.HOLD, wait=False)
+    while not motor.done():
+        if motor.stalled():
+            motor.hold()
+            log("  {} stalled — holding at {}".format(name, motor.angle()))
+            break
+        wait(10)
+
+def back_grab_goto(target_deg):
+    _grab_goto(back_grab, target_deg, "back grabber")
+
+def front_grab_goto(target_deg):
+    _grab_goto(front_grab, target_deg, "front grabber")
+
+# ------------------------------------------------------------
+# COLOR CLASSIFIER
+# ------------------------------------------------------------
+def classify(h, s, v):
+    if s >= SAT_MIN and v >= V_MIN:
+        if h >= 330 or h <= 15:
+            return "RED"
+        if 25 <= h <= 55:
+            return "YELLOW"
+        if 140 <= h <= 185:
+            return "GREEN"
+        if 200 <= h <= 235:
+            return "BLUE"
+    if s <= WHITE_S_MAX and v >= WHITE_V_MIN:
+        return "WHITE"
+    return None
+
+# ------------------------------------------------------------
+# SCAN PASS — offset-based distance, NO drive.reset() here.
+# drive.drive()/drive.stop()/drive.distance() are all standard
+# Pybricks — unchanged.
+# ------------------------------------------------------------
+def scan_row():
+    log("SCAN: start")
+    found = []                    # (entry_pos, color, peak_v)
+    last, hits, entry_pos = None, 0, 0
+    peak_v = 0
+    rearm_at = 0
+    row_start = drive.distance()  # offset — frame preserved
+
+    drive.drive(SCAN_SPEED, 0)
+
+    while drive.distance() - row_start < SCAN_LENGTH:
+        d = drive.distance() - row_start
+        if d >= rearm_at:
+            hsv = floor_sensor.hsv()
+            c = classify(hsv.h, hsv.s, hsv.v)
+            if c is not None and c == last:
+                hits += 1
+                peak_v = max(peak_v, hsv.v)
+            elif c is not None:
+                last, hits, entry_pos = c, 1, d
+                peak_v = hsv.v
+            else:
+                last, hits = None, 0
+
+            if hits >= 2:
+                found.append((entry_pos, c, peak_v))
+                log("  {} at ~{} mm (peak V {})".format(c, entry_pos, peak_v))
+                rearm_at = d + MIN_GAP
+                last, hits = None, 0
+        wait(20)
+
+    drive.stop()
+    return found
+
+# ------------------------------------------------------------
+# MERGE split bases + DOUBLE-WHITE resolution
+# ------------------------------------------------------------
+def merge(detections):
+    merged = []
+    for pos, c, pv in detections:
+        if merged and merged[-1][1] == c and pos - merged[-1][0] < 70:
+            p0, c0, pv0 = merged[-1]
+            merged[-1] = (p0, c0, max(pv0, pv))
+            continue
+        merged.append((pos, c, pv))
+    return merged
+
+def resolve_double_white(notes):
+    whites = [n for n in notes if n[1] == "WHITE"]
+    if len(whites) == 2:
+        weaker = min(whites, key=lambda n: n[2])
+        log("Double white: weaker (V {}) at {} mm -> BLACK".format(
+            weaker[2], weaker[0]))
+        notes = [(p, "BLACK", pv) if (p == weaker[0] and c == "WHITE")
+                 else (p, c, pv) for p, c, pv in notes]
+    elif len(whites) > 2:
+        print("WARNING: {} whites detected — check thresholds!".format(len(whites)))
+    return notes
+
+# ------------------------------------------------------------
+# SLOT LOGIC — GREEN(2)/RED(3) anchored
+# ------------------------------------------------------------
+def build_map(detections):
+    notes = resolve_double_white(merge(detections))
+    colors = [c for _, c, _ in notes]
+    pos = {c: p for p, c, _ in notes}
+    slot_map = [None] * 6
+
+    if "GREEN" not in pos or "RED" not in pos:
+        print("ERROR: GREEN/RED anchor missing — got", colors)
+        return slot_map
+
+    slot_map[2] = "GREEN"
+    slot_map[3] = "RED"
+    spacing = pos["RED"] - pos["GREEN"]
+    log("spacing reference (green->red) = {} mm".format(spacing))
+
+    gi = colors.index("GREEN")
+    ri = colors.index("RED")
+    before = [(pos[c], c) for c in colors[:gi]]
+    after  = [(pos[c], c) for c in colors[ri + 1:]]
+    if ri != gi + 1:
+        print("WARNING: unexpected color between GREEN and RED:",
+              colors[gi + 1:ri])
+
+    if len(before) == 2:
+        slot_map[0], slot_map[1] = before[0][1], before[1][1]
+    elif len(before) == 1:
+        p, c = before[0]
+        gap = pos["GREEN"] - p
+        if gap < 1.5 * spacing:
+            slot_map[1] = c
+            slot_map[0] = "BLACK"
+            log("BLACK at slot 0 ({}->GREEN gap {} ~ 1x)".format(c, gap))
+        else:
+            slot_map[0] = c
+            slot_map[1] = "BLACK"
+            log("BLACK at slot 1 ({}->GREEN gap {} ~ 2x)".format(c, gap))
+    else:
+        print("WARNING: {} colors left of GREEN".format(len(before)))
+
+    if len(after) == 2:
+        slot_map[4], slot_map[5] = after[0][1], after[1][1]
+    elif len(after) == 1:
+        p, c = after[0]
+        gap = p - pos["RED"]
+        if gap < 1.5 * spacing:
+            slot_map[4] = c
+            slot_map[5] = "BLACK"
+            log("BLACK at slot 5 (RED->{} gap {} ~ 1x)".format(c, gap))
+        else:
+            slot_map[5] = c
+            slot_map[4] = "BLACK"
+            log("BLACK at slot 4 (RED->{} gap {} ~ 2x)".format(c, gap))
+    else:
+        print("WARNING: {} colors right of RED".format(len(after)))
+
+    if slot_map.count("BLACK") != 1:
+        print("WARNING: BLACK placed {} times".format(slot_map.count("BLACK")))
+
+    return slot_map
+
+# ------------------------------------------------------------
+# MISSION 1 — SCAN
+# Pure Pybricks: straight + relative turn. No hidden turns.
+# ------------------------------------------------------------
+def scan_mission():
+    log("SCAN MISSION: start")
+
+    # approach on placement heading (0)
+    drive.settings(straight_speed=APPROACH_SPEED)
+    drive.straight(APPROACH_MM)          # heading 0
+    drive.turn(-90)                      # heading now -90 (scan row)
+
+    drive.settings(straight_speed=SCAN_SPEED)
+    detections = scan_row()
+    log("heading after scan: {:.1f} (expect ~-90)".format(drive.angle()))
+
+    slot_map = build_map(detections)
+
+    print("")
+    print("========== FINAL SLOT MAP ==========")
+    for i in range(6):
+        tag = " (fixed)" if i in (2, 3) else ""
+        print("  Slot {} : {}{}".format(
+            i, slot_map[i] if slot_map[i] else "???", tag))
+    print("====================================")
+    return slot_map
+
+# ------------------------------------------------------------
+# MISSION 2 — CABLE 1 (same tuned distances, relative turns)
+# Heading ledger: enters at -90, ends at -240.
+# ------------------------------------------------------------
+def cables_mission():
+    log("CABLES: start")
+    drive.settings(straight_speed=300)
+
+    # STEP 1: forward 450 (heading -90)
+    drive.straight(350)
+
+    # STEP 2: turn LEFT 90  ->  heading -180
+    #drive.turn(-90)
+    drive.curve(150,-90)
+
+    # STEP 3: back grabber to PARTIAL CLOSE (40)
+    back_grab_goto(BACK_PC)
+
+    # STEP 4: BACKWARD 150 (heading -180)
+    drive.straight(-300)
+
+    # STEP 5: back grabber to TRAP
+    back_grab_goto(BACK_TRAP)
+
+    # STEP 6: FORWARD 300 (heading -180)
+    drive.straight(260)
+
+    # STEP 7: turn LEFT 60  ->  heading -240 (confirmed final)
+    drive.turn(-80)
+
+    # STEP 8: BACKWARD 600, then nudge forward 20 (heading -240)
+    drive.straight(-600)
+    drive.straight(40)
+
+    # STEP 9: RELEASE (40)
+    back_grab_goto(BACK_RELEASE)
+    wait(500)
+
+    log("heading at end: {:.1f} (expect ~-240)".format(drive.angle()))
+    log("CABLES: done")
+
+# MISSION 3 — CABLE 2 (tuned distances, relative turns)
+# Heading ledger: enters at -90, ends at -240.
+# ------------------------------------------------------------
+def cables_mission2():
+    log("CABLES2: start")
+    drive.settings(straight_speed=300) # if you want to change speed 
+
+    # STEP 1: forward 450 (heading -90)
+    drive.straight(570)
+
+    # STEP 2: turn LEFT 90  ->  heading -180
+    #drive.turn(-100)
+    drive.curve(0,-100)
+
+    # STEP 3: back grabber to PARTIAL CLOSE (40)
+    back_grab_goto(BACK_PC)
+
+    # STEP 4: BACKWARD 150 (heading -180)
+    drive.straight(-700)
+
+    # STEP 5: back grabber to TRAP
+    back_grab_goto(BACK_TRAP)
+
+    # STEP 6: FORWARD 300 (heading -180)
+    drive.straight(540)
+
+    # STEP 7: turn LEFT 60  ->  heading -240 (confirmed final)
+    drive.turn(80)
+
+    # STEP 8: BACKWARD 600, then nudge forward 20 (heading -240)
+    drive.straight(-600)
+    drive.straight(50)
+
+    # STEP 9: RELEASE (40)
+    back_grab_goto(BACK_RELEASE)
+    wait(500)
+
+    log("heading at end: {:.1f} (expect ~-240)".format(drive.angle()))
+    log("CABLES: done")
+
+# ------------------------------------------------------------
+# RUN — drive.reset() ONCE (scan distance offset needs it).
+# ------------------------------------------------------------
+timer.reset()
+drive.reset()                # placement = heading 0, distance 0
+
+slot_map = scan_mission()
+cables_mission()
+cables_mission2()
+
+drive.stop()
+log("MISSION COMPLETE")
